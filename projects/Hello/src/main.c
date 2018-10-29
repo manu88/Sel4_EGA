@@ -5,6 +5,8 @@
 #include <sel4platsupport/io.h>
 
 #include <sel4platsupport/bootinfo.h>
+#include <sel4platsupport/arch/io.h> //jm
+#include <platsupport/chardev.h> //jm
 
 #include <sel4utils/vspace.h>
 
@@ -44,6 +46,7 @@ typedef struct
 
 
 static Env _env;
+static ps_chardevice_t devKeyboard;
 
 /* initialise our runtime environment */
 static void
@@ -111,6 +114,20 @@ int main(void)
 
     init_env(&_env);
 
+    printf("Init keyboard...\n");
+
+    struct ps_io_ops    opsIO;
+    sel4platsupport_get_io_port_ops(&opsIO.io_port_ops, &_env.simple , &_env.vka);
+
+    ps_chardevice_t *devKeyboardRet;
+
+    devKeyboardRet = ps_cdev_init(PC99_KEYBOARD_PS2, &opsIO, &devKeyboard);
+
+    if (devKeyboardRet == NULL)
+    {
+	printf("Error init keyboard\n");
+	return 1;
+    }
 
     printf("Map EGA mem\n");
 
@@ -122,9 +139,17 @@ int main(void)
     	writeVideoRam((uint16_t*)vram, i);
     }
 
-    while(1)
+
+    for(;;) 
     {
+        int c = ps_cdev_getchar(&devKeyboard);
+        if (c != EOF) 
+    	{
+            printf("You typed [%c]\n", c);
+        }
+        fflush(stdout);
     }
+
 
     return 0;
 }
