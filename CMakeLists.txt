@@ -19,5 +19,5 @@ endif()
 # and they don't initialize a platsupport driver.
 ApplyCommonReleaseVerificationSettings(FALSE FALSE)
 
+SetSimulationScriptProperty(GRAPHIC TRUE)
 GenerateSimulateScript()
-
