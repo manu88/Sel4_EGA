@@ -12,7 +12,7 @@
 
 #include <allocman/bootstrap.h>
 #include <allocman/vka.h>
-
+#include <vka/capops.h>
 //#include <utils/util.h>
 
 
@@ -31,6 +31,8 @@ static sel4utils_alloc_data_t data;
 #define MODE_WIDTH 80
 #define MODE_HEIGHT 25
 
+
+#define KEY_BADGE 10
 typedef struct 
 {
     seL4_BootInfo *info;
@@ -42,11 +44,22 @@ typedef struct
     simple_t simple;
     /* platsupport I/O */
     ps_io_ops_t io_ops;
+
+//    cspacepath_t keyboardirq_path;
 } Env;
 
 
+typedef struct _chardev_t {
+    /* platsupport char device */
+    ps_chardevice_t dev;
+    /* IRQHandler cap (with cspace path) */
+    cspacepath_t handler;
+    /* endpoint cap (with cspace path) device is waiting for IRQ */
+    cspacepath_t ep;
+} chardev_t;
+
+
 static Env _env;
-static ps_chardevice_t devKeyboard;
 
 /* initialise our runtime environment */
 static void
@@ -80,6 +93,9 @@ init_env(Env *env)
     //initialize env->io_ops
     error = sel4platsupport_new_io_ops( env->vspace, env->vka, &env->io_ops);
     assert(error == 0);
+
+    sel4platsupport_get_io_port_ops(&env->io_ops.io_port_ops, &env->simple , &env->vka);
+
 }
 
 
@@ -105,12 +121,76 @@ void writeVideoRam(uint16_t* vram, int row)
     }
 }
 
+// creates IRQHandler cap "handler" for IRQ "irq"
+static void
+get_irqhandler_cap(int irq, cspacepath_t* handler)
+{
+    seL4_CPtr cap;
+    // get a cspace slot
+    UNUSED int err = vka_cspace_alloc(&_env.vka, &cap);
+    assert(err == 0);
+
+    // convert allocated cptr to a cspacepath, for use in
+    // operations such as Untyped_Retype
+    vka_cspace_make_path(&_env.vka, cap, handler);
+
+    // exec seL4_IRQControl_Get(seL4_CapIRQControl, irq, ...)
+    // to get an IRQHandler cap for IRQ "irq"
+    err = simple_get_IRQ_handler(&_env.simple, irq, *handler);
+    assert(err == 0);
+}
+
+// finalize device setup
+// hook up endpoint (dev->ep) with IRQ of char device (dev->dev)
+void set_devEp(chardev_t* dev) {
+    // Loop through all IRQs and get the one device needs to listen to
+    // We currently assume there it only needs one IRQ.
+    int irq;
+    for (irq = 0; irq < 256; irq++) {
+        if (ps_cdev_produces_irq(&dev->dev, irq)) {
+            break;
+        }
+    }
+    printf ("irq=%d\n", irq);
+
+    //create IRQHandler cap
+    get_irqhandler_cap(irq, &dev->handler);
+
+    /* Assign AEP to the IRQ handler. */
+    UNUSED int err = seL4_IRQHandler_SetNotification(
+            dev->handler.capPtr, dev->ep.capPtr);
+    assert(err == 0);
+
+    //read once: not sure why, but it does not work without it, it seems
+    ps_cdev_getchar(&dev->dev);
+    err = seL4_IRQHandler_Ack(dev->handler.capPtr);
+    assert(err == 0);
+}
+
+static void handle_cdev_event( chardev_t* dev) 
+{
+    for (;;) 
+    {
+        //int c = __arch_getchar();
+        int c = ps_cdev_getchar(&dev->dev);
+        if (c == EOF) {
+            //read till we get EOF
+            break;
+        }
+        printf("You typed [%c]\n", c);
+    }
+
+    UNUSED int err = seL4_IRQHandler_Ack(dev->handler.capPtr);
+    assert(err == 0);
+}
+
+
 int main(void)
 {
-
+    int error;
      _env.info = platsupport_get_bootinfo();
 
-	simple_default_init_bootinfo(&_env.simple, _env.info);
+    simple_default_init_bootinfo(&_env.simple, _env.info);
 
     init_env(&_env);
 
@@ -119,15 +199,6 @@ int main(void)
     struct ps_io_ops    opsIO;
     sel4platsupport_get_io_port_ops(&opsIO.io_port_ops, &_env.simple , &_env.vka);
 
-    ps_chardevice_t *devKeyboardRet;
-
-    devKeyboardRet = ps_cdev_init(PC99_KEYBOARD_PS2, &opsIO, &devKeyboard);
-
-    if (devKeyboardRet == NULL)
-    {
-	printf("Error init keyboard\n");
-	return 1;
-    }
 
     printf("Map EGA mem\n");
 
@@ -140,14 +211,74 @@ int main(void)
     }
 
 
+    vka_object_t mainEndpoint = {0};
+
+    error = vka_alloc_endpoint(&_env.vka, &mainEndpoint);
+    assert(error == 0);
+
+    vka_object_t notification = {0};
+
+    error = vka_alloc_notification(&_env.vka, &notification);
+    assert(error == 0);
+
+
+    /* bind the notification to the current thread */
+    error = seL4_TCB_BindNotification(seL4_CapInitThreadTCB, notification.cptr);
+    assert(error == 0);
+
+    // create space for notification
+    cspacepath_t notification_path;
+    vka_cspace_make_path(&_env.vka, notification.cptr, &notification_path);
+
+    // create a badged notif for the keyboard
+    //cspacepath_t badged_notification;
+    //error = vka_cspace_alloc_path(&_env.vka, &badged_notification);
+    //assert(error == 0);
+
+    chardev_t keyboard;
+
+    error = vka_cspace_alloc_path(&_env.vka, &keyboard.ep);
+    assert(error == 0);
+
+    printf("MINT\n");
+    error = vka_cnode_mint(&keyboard.ep,& notification_path/*badged_notification*/, seL4_AllRights, KEY_BADGE);
+    assert(error == 0); 
+
+
+    ps_chardevice_t *ret;
+
+    ret = ps_cdev_init(PC99_KEYBOARD_PS2, &_env.io_ops, &keyboard.dev);
+    assert(ret != NULL);
+    
+    set_devEp(&keyboard);
+
     for(;;) 
     {
+
+
+        seL4_Word sender_badge = 0;
+        seL4_MessageInfo_t message;
+        seL4_Word label;
+
+        message = seL4_Recv(mainEndpoint.cptr, &sender_badge);
+
+	if (sender_badge == KEY_BADGE)
+	{
+		handle_cdev_event( &keyboard);
+	}
+	else 
+	{
+    	    printf("Got OTHER sender_badge %li\n",sender_badge);
+
+	}
+/*
         int c = ps_cdev_getchar(&devKeyboard);
         if (c != EOF) 
     	{
             printf("You typed [%c]\n", c);
         }
         fflush(stdout);
+*/
     }
 
 
